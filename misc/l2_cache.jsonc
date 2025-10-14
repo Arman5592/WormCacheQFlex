@@ -1,0 +1,19 @@
+{
+    "associativity": 4, //: u64
+    "tags": [ //: [[CacheLine { tag: u64, writable: bool, dirty: bool }]]
+        [
+            // We don't have to track the invalid cache frame. The empty place is inferred from the associativity.
+            // The least recently used lines are placed in the beginning.
+            {
+                "tag": 0, //: u64, this is calculated by removing the offset and index bits from the address
+                "writable": true, //: bool
+                "dirty": false //: bool
+            },
+            {
+                "tag": 1,
+                "writable": false,
+                "dirty": false
+            }
+        ]
+    ]
+}

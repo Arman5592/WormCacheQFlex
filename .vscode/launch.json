@@ -1,0 +1,66 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "gabps-multicore",
+            "program": "/home/xusine/paraflex/qemu/build/qemu-system-aarch64",
+            "args": [
+                "-smp", "4",
+                "-M", "virt",
+                "-cpu", "max",
+                "-m", "16G",
+                "-boot", "menu=on",
+                "-rtc", "clock=vm",
+                "-drive", "file=QEMU_EFI.qcow2,format=qcow2,if=pflash,read-only=on",
+                "-drive", "file=QEMU_VARS.qcow2,format=qcow2,if=pflash,read-only=on",
+                "-drive", "if=virtio,file=root.qcow2,format=qcow2",
+                "-netdev", "user,id=unet,hostfwd=tcp::2244-:22",
+                "-device", "virtio-net-device,netdev=unet",
+                "-net", "user",
+                "-nographic",
+                "-no-reboot",
+                "-quantum", 
+                "size=1024",
+                "-plugin", "/home/xusine/paraflex/WormCache/target/debug/libworm_cache.so",
+                "-loadvm", "base",
+            ],
+            "cwd": "/home/xusine/paraflex/debug/multicore-workloads",
+            "relativePathBase": "/home/xusine/paraflex/debug/multicore-workloads",
+            "sourceLanguages": ["rust", "c"],
+
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "htop-singlecore",
+            "program": "/home/xusine/paraflex/qemu/build/qemu-system-aarch64",
+            "args": [
+                "-smp", "1",
+                "-M", "virt",
+                "-cpu", "max",
+                "-m", "1G",
+                "-boot", "menu=on",
+                "-rtc", "clock=vm",
+                "-drive", "file=QEMU_EFI.qcow2,format=qcow2,if=pflash,read-only=on",
+                "-drive", "file=QEMU_VARS.qcow2,format=qcow2,if=pflash,read-only=on",
+                "-drive", "if=virtio,file=root.qcow2,format=qcow2",
+                "-netdev", "user,id=unet,hostfwd=tcp::2244-:22",
+                "-device", "virtio-net-device,netdev=unet",
+                "-net", "user",
+                "-nographic",
+                "-no-reboot",
+                "-loadvm", "base",
+                "-plugin", "/home/xusine/paraflex/WormCache/target/debug/libworm_cache.so",
+            ],
+            "cwd": "/home/xusine/paraflex/debug/htop-singlecore",
+            "relativePathBase": "/home/xusine/paraflex/debug/htop-singlecore",
+            "sourceLanguages": ["rust", "c"],
+
+        }
+    ]
+}

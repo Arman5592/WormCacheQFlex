@@ -296,6 +296,7 @@ pub struct PluginList {
     _lm: crate::ParallelCacheHierarchyPlugin,
     // _lm: crate::SingleCacheHierarchyPlugin,
     // _t: crate::TracePlugin,
+    _dpt: crate::DirtyPageTrackerPlugin,
 }
 
 /**
@@ -326,3 +327,11 @@ pub const ENABLE_EXCLUSIVE_CACHE_STATE: bool = true;
  * This is used to record the cache line coherence history so that you can debug the cache coherence protocol.
  */
 pub const ENABLE_CACHE_LINE_HISTORY: bool = false;
+
+/**
+ * Whether to enable the dirty page tracker.
+ *
+ * This tracks all memory stores and maintains a bytemap of dirty pages.
+ * Every second, it logs the number of dirty pages to dirty_pages.csv.
+ */
+pub const ENABLE_DIRTY_PAGE_TRACKER: bool = true;

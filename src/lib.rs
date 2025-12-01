@@ -57,6 +57,8 @@ use components::instruction_frequency::InstructionFrequencyPlugin;
 #[allow(unused_imports)]
 use components::pw_log::PageWalkLoggerPlugin;
 #[allow(unused_imports)]
+use components::dirty_page_tracker::DirtyPageTrackerPlugin;
+#[allow(unused_imports)]
 use components::touch_once::TouchOnePlugin;
 #[allow(unused_imports)]
 use components::trace::TracePlugin;

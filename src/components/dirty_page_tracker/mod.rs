@@ -30,10 +30,7 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::ffi;
-use std::fs::File;
-use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 use std::sync::LazyLock;
 
 use crate::qemu_api;
@@ -59,8 +56,6 @@ static DIRTY_PAGE_BYTEMAP_1: LazyLock<DashMap<u64, u8>> = LazyLock::new(|| {
 // Current period's dirty page count (pages dirtied in the current 10s period)
 // This is updated when buffers are swapped and cleared
 static CURRENT_PERIOD_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-static LOG_FILE: LazyLock<Mutex<Option<File>>> = LazyLock::new(|| Mutex::new(None));
 
 unsafe extern "C" fn vcpu_mem_access(
     _vcpu_idx: u32,
@@ -142,24 +137,6 @@ fn swap_and_count_buffers() -> usize {
     dirty_count
 }
 
-fn log_dirty_pages() {
-    // Swap buffers and get the count for the period that just ended
-    let dirty_count = swap_and_count_buffers();
-    let timestamp = get_monotonic_ts();
-
-    // Log the count for this period (optional - main output is now in statistics.csv)
-    if let Ok(mut file_guard) = LOG_FILE.lock() {
-        if let Some(file) = file_guard.as_mut() {
-            if let Err(e) = file.write_fmt(format_args!("{},{}\n", timestamp, dirty_count)) {
-                eprintln!("Error writing to dirty page log: {}", e);
-            }
-            if let Err(e) = file.flush() {
-                eprintln!("Error flushing dirty page log: {}", e);
-            }
-        }
-    }
-}
-
 pub struct DirtyPageTrackerPlugin {}
 
 impl super::Plugin for DirtyPageTrackerPlugin {
@@ -170,42 +147,7 @@ impl super::Plugin for DirtyPageTrackerPlugin {
         }
 
         println!("Dirty page tracker plugin initialized.");
-
-        // Initialize the log file
-        let file_path = "/mnt/ssd4t/home/arman/qflex/m/dirty_pages.csv";
-        let file = File::create(file_path).expect(&format!("Failed to create {}", file_path));
-        *LOG_FILE.lock().unwrap() = Some(file);
-
-        // Write CSV header
-        if let Ok(mut file_guard) = LOG_FILE.lock() {
-            if let Some(file) = file_guard.as_mut() {
-                file.write_all(b"timestamp,dirty_page_count\n")
-                    .expect("Failed to write CSV header");
-            }
-        }
-
-        // Spawn a thread to periodically swap buffers and log dirty page count
-        // Note: The main swap happens when statistics are written (every 10s) via swap_buffers_for_statistics()
-        // This thread is just for the backup log file, and will swap less frequently to avoid double-swapping
-        // We'll swap every 10 seconds but the statistics thread will handle the actual swap
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(10));
-                // Just log the current count without swapping (swap is handled by statistics thread)
-                let dirty_count = get_dirty_page_count();
-                let timestamp = get_monotonic_ts();
-                if let Ok(mut file_guard) = LOG_FILE.lock() {
-                    if let Some(file) = file_guard.as_mut() {
-                        if let Err(e) = file.write_fmt(format_args!("{},{}\n", timestamp, dirty_count)) {
-                            eprintln!("Error writing to dirty page log: {}", e);
-                        }
-                        if let Err(e) = file.flush() {
-                            eprintln!("Error flushing dirty page log: {}", e);
-                        }
-                    }
-                }
-            }
-        });
+        // Note: Dirty page counts are logged to dirty_pages_and_cache_misses.csv via the statistics thread
     }
 
     #[inline]

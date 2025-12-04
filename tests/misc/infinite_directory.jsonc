@@ -1,0 +1,6 @@
+[ // this list is not ordered.
+    {
+        "tag": 0,  // the block ID of the cache line
+        "sharers": [] // [u64], which is a bitset of the core IDs that have the cache line 
+    }
+]

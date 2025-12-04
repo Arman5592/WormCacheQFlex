@@ -1,0 +1,24 @@
+{
+    "BTB": [
+        [
+            {
+                "PC": 0, // u64
+                "target": 0, // u64
+                "type": 0 // 0 -> NonBranch, 1 -> Conditional, 2 -> Unconditional, 3 -> Call, 4 -> IndirectReg, 5 -> IndirectCall, 6 -> Return
+            }
+        ]
+    ],
+    "BiModal": [
+        0 // 0 -> StronglyTaken, 1 -> Taken, 2 -> NotTaken, 3 -> StronglyNotTaken
+    ],
+    "MetaBiModal": [ // this is the predictor to select whether to use gshare or BiModal
+        0 // 0 -> StronglyTaken, 1 -> Taken, 2 -> NotTaken, 3 -> StronglyNotTaken 
+    ],
+    "GShare": {
+        "shift": 0, // u64
+        "shiftSize": 0, // u64
+        "pattern": [
+            0 // 0 -> StronglyTaken, 1 -> Taken, 2 -> NotTaken, 3 -> StronglyNotTaken
+        ]
+    }
+}

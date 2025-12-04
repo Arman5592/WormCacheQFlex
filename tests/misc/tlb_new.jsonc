@@ -1,0 +1,13 @@
+{
+    "associativity": 4,
+    "entries": [
+        [
+            {
+                "vpn": 0,
+                "ppn": 0,
+                "ng": false,
+                "asid": 0
+            } // LRU element is placed in the beginning.
+        ]
+    ]
+}

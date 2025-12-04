@@ -1,0 +1,45 @@
+workspace = { members = ["plugin_helper"] }
+[package]
+name = "worm_cache"
+version = "0.1.0"
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+rand = { version = "0.8.5" }
+serde_json = "1.0.111"
+serde = { version = "1.0", features = ["derive"] }
+bitvec = { version = "1.0.1", features = ["serde"] }
+plugin_helper = { path = "./plugin_helper" }
+dashmap = "5.5.3"
+gcd = "2.3.0"
+spin = "0.9.8"
+static_assertions = "1.1.0"
+libc = "0.2.154"
+rustc-hash = "2.0.0"
+strum_macros = "0.26.2"
+strum = "0.26.2"
+perf-event = "0.4.8"
+zstd = "0.13.1"
+hdrhistogram = "7.5.4"
+serde_with = "3.9.0"
+nix = { version="0.29.0", features = ["signal"] }
+
+[lib]
+crate-type=["rlib", "cdylib"]
+
+[profile.release]
+debug = true
+
+[dev-dependencies]
+divan = "0.1.21"
+tempfile = "3.17.1"
+
+[[bench]]
+name = "bp_ipc"
+harness = false
+
+[[bench]]
+name = "memory_hierarchy_ipc"
+harness = false

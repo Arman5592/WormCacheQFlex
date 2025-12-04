@@ -151,6 +151,11 @@ impl PerCoreStatistics {
             line.push_str(&format!(",{}", u));
             line.push_str(&format!(",{}", k));
         }
+        // Add dirty page count if enabled (same value for all cores since it's global)
+        if crate::parameter::ENABLE_DIRTY_PAGE_TRACKER {
+            let dirty_count = crate::components::dirty_page_tracker::get_dirty_page_count();
+            line.push_str(&format!(",{}", dirty_count));
+        }
         line
     }
 }
@@ -211,7 +216,14 @@ impl Statistics {
             .collect::<Vec<String>>()
             .join(",");
 
-        format!("ts,core_id,{}", headers)
+        // Add dirty page count column if enabled
+        let dirty_pages_header = if crate::parameter::ENABLE_DIRTY_PAGE_TRACKER {
+            ",DirtyPages"
+        } else {
+            ""
+        };
+
+        format!("ts,core_id,{}{}", headers, dirty_pages_header)
     }
 
     pub fn get_line_for_all_cores(&self, ts: u64) -> Vec<String> {
@@ -251,6 +263,20 @@ impl Statistics {
             let k = cnt[index + 1];
             (u + k, u, k)
         }
+    }
+
+    /// Get the sum of an event across all cores (total, user, kernel)
+    pub fn global_query_record_all_cores(event: EventType) -> (u64, u64, u64) {
+        let mut total = 0u64;
+        let mut total_u = 0u64;
+        let mut total_k = 0u64;
+        for core_id in 0..CORE_COUNT {
+            let (sum, u, k) = Statistics::global_query_record(core_id as u32, event);
+            total += sum;
+            total_u += u;
+            total_k += k;
+        }
+        (total, total_u, total_k)
     }
 
     pub fn global_get_line_for_all_cores(ts: u64) -> Vec<String> {
@@ -294,7 +320,24 @@ pub fn create_thread_for_periodic_log() {
             .write_fmt(format_args!("{}\n", Statistics::get_header()))
             .unwrap();
 
+        // Create separate CSV for dirty pages and SharedCacheMissDueToDataWrite
+        let mut summary_file: Option<std::fs::File> = if crate::parameter::ENABLE_DIRTY_PAGE_TRACKER {
+            let mut file = std::fs::File::create("dirty_pages_and_cache_misses.csv").unwrap();
+            file.write_all(b"timestamp,DirtyPages,SharedCacheMissDueToDataWrite\n").unwrap();
+            Some(file)
+        } else {
+            None
+        };
+
         loop {
+            // Swap dirty page buffers to get count for the period that just ended
+            // This ensures synchronization with the statistics write interval
+            let dirty_page_count: usize = if crate::parameter::ENABLE_DIRTY_PAGE_TRACKER {
+                crate::components::dirty_page_tracker::swap_buffers_for_statistics()
+            } else {
+                0
+            };
+
             // update the local target time before writing the statistics
             for core_id in 0..CORE_COUNT {
                 Statistics::global_set(
@@ -305,9 +348,20 @@ pub fn create_thread_for_periodic_log() {
                 );
             }
 
-            for stat in Statistics::global_get_line_for_all_cores(get_monotonic_ts()) {
+            let ts = get_monotonic_ts();
+            for stat in Statistics::global_get_line_for_all_cores(ts) {
                 miss_file.write_all(stat.as_bytes()).unwrap();
                 miss_file.write_all(b"\n").unwrap();
+            }
+
+            // Write to summary CSV: dirty pages and SharedCacheMissDueToDataWrite
+            if let Some(ref mut file) = summary_file {
+                let (cache_misses_total, _, _) = Statistics::global_query_record_all_cores(
+                    EventType::SharedCacheMissDueToDataWrite
+                );
+                file.write_fmt(format_args!("{},{},{}\n", ts, dirty_page_count, cache_misses_total))
+                    .unwrap();
+                file.flush().unwrap();
             }
 
             std::thread::sleep(std::time::Duration::from_secs(10));

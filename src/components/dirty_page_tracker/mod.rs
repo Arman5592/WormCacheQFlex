@@ -30,27 +30,33 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::ffi;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::LazyLock;
 
 use crate::qemu_api;
-use crate::util::get_monotonic_ts;
+// use crate::util::get_monotonic_ts;
 use crate::parameter;
-use dashmap::DashMap;
+// use dashmap::DashMap;
 use rustc_hash::FxHashMap;
 
 const PAGE_SIZE: usize = 4096; // 4KB pages
 const DIRTY_BYTE: u8 = 0xFF; // 11111111 in binary
+const MAX_RAM_SIZE_GB: usize = 64;
+// Calculate total pages for 64GB RAM
+// 64 * 1024 * 1024 * 1024 / 4096 = 16,777,216 pages
+const MAX_PAGES: usize = (MAX_RAM_SIZE_GB * 1024 * 1024 * 1024) / PAGE_SIZE;
 
 // Double-buffered sparse bytemaps for lock-free concurrent access
-// Using DashMap for lock-free concurrent access - safe since we only ever set to 0xFF and never reset
 // Active buffer index (0 or 1) - atomically swapped every period
 static ACTIVE_BUFFER: AtomicUsize = AtomicUsize::new(0);
-static DIRTY_PAGE_BYTEMAP_0: LazyLock<DashMap<u64, u8>> = LazyLock::new(|| {
-    DashMap::new()
+
+// Use Vec<AtomicU8> for the bitmap. This allows "benign races" legally in Rust.
+// No locks, no sharding, just pure memory stores.
+static DIRTY_PAGE_BYTEMAP_0: LazyLock<Vec<AtomicU8>> = LazyLock::new(|| {
+    (0..MAX_PAGES).map(|_| AtomicU8::new(0)).collect()
 });
-static DIRTY_PAGE_BYTEMAP_1: LazyLock<DashMap<u64, u8>> = LazyLock::new(|| {
-    DashMap::new()
+static DIRTY_PAGE_BYTEMAP_1: LazyLock<Vec<AtomicU8>> = LazyLock::new(|| {
+    (0..MAX_PAGES).map(|_| AtomicU8::new(0)).collect()
 });
 
 // Current period's dirty page count (pages dirtied in the current 10s period)
@@ -58,12 +64,16 @@ static DIRTY_PAGE_BYTEMAP_1: LazyLock<DashMap<u64, u8>> = LazyLock::new(|| {
 static CURRENT_PERIOD_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" fn vcpu_mem_access(
-    _vcpu_idx: u32,
+    vcpu_idx: u32,
     info: qemu_api::qemu_plugin_meminfo_t,
     vaddr: u64,
     _: *mut ffi::c_void,
 ) {
     unsafe {
+        if parameter::MEASURE_HALF_OF_CORES && vcpu_idx >= parameter::CORE_COUNT as u32 / 2 {
+            return;
+        }
+
         // Early return if feature is disabled
         if !parameter::ENABLE_DIRTY_PAGE_TRACKER {
             return;
@@ -79,17 +89,19 @@ unsafe extern "C" fn vcpu_mem_access(
 
         if !is_device {
             let pa = qemu_api::qemu_plugin_hwaddr_phys_addr(hw_handler);
-            let page_num = pa >> 12; // Divide by PAGE_SIZE (4096)
+            let page_num = (pa as usize) / PAGE_SIZE;
 
-            // Get the active buffer index atomically (no mutex needed for reads)
-            let active_idx = ACTIVE_BUFFER.load(Ordering::Acquire);
-            
-            // Set the byte for this page to 0xFF (dirty) in the active buffer
-            // DashMap is lock-free and safe for concurrent access since we only ever set to 0xFF
-            if active_idx == 0 {
-                DIRTY_PAGE_BYTEMAP_0.insert(page_num, DIRTY_BYTE);
-            } else {
-                DIRTY_PAGE_BYTEMAP_1.insert(page_num, DIRTY_BYTE);
+            if page_num < MAX_PAGES {
+                // Get the active buffer index atomically (no mutex needed for reads)
+                let active_idx = ACTIVE_BUFFER.load(Ordering::Relaxed);
+                
+                // Relaxed ordering is sufficient because we only care about the 
+                // final value when we swap buffers later (barrier).
+                if active_idx == 0 {
+                    DIRTY_PAGE_BYTEMAP_0[page_num].store(DIRTY_BYTE, Ordering::Relaxed);
+                } else {
+                    DIRTY_PAGE_BYTEMAP_1[page_num].store(DIRTY_BYTE, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -117,18 +129,21 @@ fn swap_and_count_buffers() -> usize {
     
     // Count dirty pages in the buffer that was just swapped out (now inactive)
     // After the swap, all new writes go to the new buffer, so old_active is safe to read
-    let dirty_count = if old_active == 0 {
-        DIRTY_PAGE_BYTEMAP_0.len()
+    // We iterate, count non-zero entries, and clear them simultaneously.
+    let buffer = if old_active == 0 {
+        &DIRTY_PAGE_BYTEMAP_0
     } else {
-        DIRTY_PAGE_BYTEMAP_1.len()
+        &DIRTY_PAGE_BYTEMAP_1
     };
-    
-    // Clear the buffer that was just counted (prepare it for next period)
-    // This is safe because it's now inactive, so no writes are happening to it
-    if old_active == 0 {
-        DIRTY_PAGE_BYTEMAP_0.clear();
-    } else {
-        DIRTY_PAGE_BYTEMAP_1.clear();
+
+    let mut dirty_count = 0;
+    // Iterating over the vector is fast (sequential memory access).
+    for byte in buffer.iter() {
+        if byte.load(Ordering::Relaxed) != 0 {
+            dirty_count += 1;
+            // Clear the byte for the next reuse
+            byte.store(0, Ordering::Relaxed);
+        }
     }
     
     // Update the current period count atomically

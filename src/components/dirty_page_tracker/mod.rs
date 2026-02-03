@@ -46,22 +46,90 @@ const MAX_RAM_SIZE_GB: usize = 64;
 // 64 * 1024 * 1024 * 1024 / 4096 = 16,777,216 pages
 const MAX_PAGES: usize = (MAX_RAM_SIZE_GB * 1024 * 1024 * 1024) / PAGE_SIZE;
 
-// Double-buffered sparse bytemaps for lock-free concurrent access
-// Active buffer index (0 or 1) - atomically swapped every period
-static ACTIVE_BUFFER: AtomicUsize = AtomicUsize::new(0);
+// Encapsulated tracker for a single time domain (Host or Guest)
+struct DirtyPageSet {
+    // Active buffer index (0 or 1) - atomically swapped every period
+    active_buffer: AtomicUsize,
+    // Double-buffered sparse bytemaps
+    buffer_0: Vec<AtomicU8>,
+    buffer_1: Vec<AtomicU8>,
+    // Count for the last completed period
+    period_count: AtomicUsize,
+}
 
-// Use Vec<AtomicU8> for the bitmap. This allows "benign races" legally in Rust.
-// No locks, no sharding, just pure memory stores.
-static DIRTY_PAGE_BYTEMAP_0: LazyLock<Vec<AtomicU8>> = LazyLock::new(|| {
-    (0..MAX_PAGES).map(|_| AtomicU8::new(0)).collect()
-});
-static DIRTY_PAGE_BYTEMAP_1: LazyLock<Vec<AtomicU8>> = LazyLock::new(|| {
-    (0..MAX_PAGES).map(|_| AtomicU8::new(0)).collect()
-});
+impl DirtyPageSet {
+    fn new() -> Self {
+        Self {
+            active_buffer: AtomicUsize::new(0),
+            buffer_0: (0..MAX_PAGES).map(|_| AtomicU8::new(0)).collect(),
+            buffer_1: (0..MAX_PAGES).map(|_| AtomicU8::new(0)).collect(),
+            period_count: AtomicUsize::new(0),
+        }
+    }
 
-// Current period's dirty page count (pages dirtied in the current 10s period)
-// This is updated when buffers are swapped and cleared
-static CURRENT_PERIOD_COUNT: AtomicUsize = AtomicUsize::new(0);
+    #[inline]
+    fn mark_dirty(&self, page_num: usize) {
+        if page_num < MAX_PAGES {
+            let active_idx = self.active_buffer.load(Ordering::Relaxed);
+            
+            if active_idx == 0 {
+                self.buffer_0[page_num].store(DIRTY_BYTE, Ordering::Relaxed);
+            } else {
+                self.buffer_1[page_num].store(DIRTY_BYTE, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn swap_and_count(&self) -> usize {
+        // Atomically swap the active buffer (0 <-> 1)
+        let old_active = self.active_buffer.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            Some(1 - current)
+        }).unwrap_or_else(|x| x);
+        
+        let buffer = if old_active == 0 {
+            &self.buffer_0
+        } else {
+            &self.buffer_1
+        };
+
+        let mut dirty_count = 0;
+        for byte in buffer.iter() {
+            if byte.load(Ordering::Relaxed) != 0 {
+                dirty_count += 1;
+                byte.store(0, Ordering::Relaxed);
+            }
+        }
+        
+        self.period_count.store(dirty_count, Ordering::Release);
+        dirty_count
+    }
+
+    fn get_count(&self) -> usize {
+        self.period_count.load(Ordering::Acquire)
+    }
+}
+
+// Instantiate two independent trackers
+static HOST_TRACKER: LazyLock<DirtyPageSet> = LazyLock::new(DirtyPageSet::new);
+static GUEST_TRACKER: LazyLock<DirtyPageSet> = LazyLock::new(DirtyPageSet::new);
+
+// Wrapper for existing statistics API (Host Time)
+pub fn get_host_dirty_page_count() -> usize {
+    HOST_TRACKER.get_count()
+}
+
+pub fn swap_host_buffers() -> usize {
+    HOST_TRACKER.swap_and_count()
+}
+
+// New API for Guest Time
+pub fn get_guest_dirty_page_count() -> usize {
+    GUEST_TRACKER.get_count()
+}
+
+pub fn swap_guest_buffers() -> usize {
+    GUEST_TRACKER.swap_and_count()
+}
 
 unsafe extern "C" fn vcpu_mem_access(
     vcpu_idx: u32,
@@ -91,67 +159,12 @@ unsafe extern "C" fn vcpu_mem_access(
             let pa = qemu_api::qemu_plugin_hwaddr_phys_addr(hw_handler);
             let page_num = (pa as usize) / PAGE_SIZE;
 
-            if page_num < MAX_PAGES {
-                // Get the active buffer index atomically (no mutex needed for reads)
-                let active_idx = ACTIVE_BUFFER.load(Ordering::Relaxed);
-                
-                // Relaxed ordering is sufficient because we only care about the 
-                // final value when we swap buffers later (barrier).
-                if active_idx == 0 {
-                    DIRTY_PAGE_BYTEMAP_0[page_num].store(DIRTY_BYTE, Ordering::Relaxed);
-                } else {
-                    DIRTY_PAGE_BYTEMAP_1[page_num].store(DIRTY_BYTE, Ordering::Relaxed);
-                }
-            }
+            // Update both trackers independently
+            HOST_TRACKER.mark_dirty(page_num);
+            GUEST_TRACKER.mark_dirty(page_num);
         }
     }
 }
-
-/// Get the number of pages dirtied in the current period (per 10s, matching statistics.csv interval)
-/// This should be called when statistics are written to ensure we get the count for the period that just ended
-pub fn get_dirty_page_count() -> usize {
-    // Return the count for the current period (updated when buffers are swapped)
-    CURRENT_PERIOD_COUNT.load(Ordering::Acquire)
-}
-
-/// Swap buffers and update the count - call this when statistics are written to ensure synchronization
-/// Returns the number of pages dirtied in the period that just ended
-pub fn swap_buffers_for_statistics() -> usize {
-    swap_and_count_buffers()
-}
-
-fn swap_and_count_buffers() -> usize {
-    // Atomically swap the active buffer (0 <-> 1)
-    // Use fetch_update to atomically toggle between 0 and 1
-    let old_active = ACTIVE_BUFFER.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-        Some(1 - current)
-    }).unwrap_or_else(|x| x);
-    
-    // Count dirty pages in the buffer that was just swapped out (now inactive)
-    // After the swap, all new writes go to the new buffer, so old_active is safe to read
-    // We iterate, count non-zero entries, and clear them simultaneously.
-    let buffer = if old_active == 0 {
-        &DIRTY_PAGE_BYTEMAP_0
-    } else {
-        &DIRTY_PAGE_BYTEMAP_1
-    };
-
-    let mut dirty_count = 0;
-    // Iterating over the vector is fast (sequential memory access).
-    for byte in buffer.iter() {
-        if byte.load(Ordering::Relaxed) != 0 {
-            dirty_count += 1;
-            // Clear the byte for the next reuse
-            byte.store(0, Ordering::Relaxed);
-        }
-    }
-    
-    // Update the current period count atomically
-    CURRENT_PERIOD_COUNT.store(dirty_count, Ordering::Release);
-    
-    dirty_count
-}
-
 pub struct DirtyPageTrackerPlugin {}
 
 impl super::Plugin for DirtyPageTrackerPlugin {

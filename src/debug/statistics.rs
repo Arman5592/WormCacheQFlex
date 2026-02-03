@@ -153,7 +153,7 @@ impl PerCoreStatistics {
         }
         // Add dirty page count if enabled (same value for all cores since it's global)
         if crate::parameter::ENABLE_DIRTY_PAGE_TRACKER {
-            let dirty_count = crate::components::dirty_page_tracker::get_dirty_page_count();
+            let dirty_count = crate::components::dirty_page_tracker::get_host_dirty_page_count();
             line.push_str(&format!(",{}", dirty_count));
         }
         line
@@ -320,8 +320,8 @@ pub fn create_thread_for_periodic_log() {
             .write_fmt(format_args!("{}\n", Statistics::get_header()))
             .unwrap();
 
-        // Create separate CSV for dirty pages and SharedCacheMissDueToDataWrite
-        let mut summary_file: Option<std::fs::File> = if crate::parameter::ENABLE_DIRTY_PAGE_TRACKER {
+        // Host Time CSV: dirty pages and SharedCacheMissDueToDataWrite (every 10s Host Time)
+        let mut host_summary_file: Option<std::fs::File> = if crate::parameter::ENABLE_DIRTY_PAGE_TRACKER {
             let mut file = std::fs::File::create("dirty_pages_and_cache_misses.csv").unwrap();
             file.write_all(b"timestamp,DirtyPages,SharedCacheMissDueToDataWrite\n").unwrap();
             Some(file)
@@ -329,42 +329,89 @@ pub fn create_thread_for_periodic_log() {
             None
         };
 
+        // Guest Time CSV: dirty pages (every 10s Guest Time)
+        let mut guest_summary_file: Option<std::fs::File> = if crate::parameter::ENABLE_DIRTY_PAGE_TRACKER {
+            let mut file = std::fs::File::create("dirty_pages_guest.csv").unwrap();
+            file.write_all(b"guest_timestamp_ns,DirtyPages,SharedCacheMissDueToDataWrite\n").unwrap();
+            Some(file)
+        } else {
+            None
+        };
+
+        let mut next_host_log_time = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut next_guest_log_time_ns = unsafe { qemu_api::qemu_plugin_get_vcpu_vtime(0) } + 100_000_000;
+
         loop {
-            // Swap dirty page buffers to get count for the period that just ended
-            // This ensures synchronization with the statistics write interval
-            let dirty_page_count: usize = if crate::parameter::ENABLE_DIRTY_PAGE_TRACKER {
-                crate::components::dirty_page_tracker::swap_buffers_for_statistics()
-            } else {
-                0
-            };
+            // 1. Host Time Logging (Every 10s Real Time)
+            if std::time::Instant::now() >= next_host_log_time {
+                // Swap Host dirty page buffers
+                let dirty_page_count: usize = if crate::parameter::ENABLE_DIRTY_PAGE_TRACKER {
+                    crate::components::dirty_page_tracker::swap_host_buffers()
+                } else {
+                    0
+                };
 
-            // update the local target time before writing the statistics
-            for core_id in 0..CORE_COUNT {
-                Statistics::global_set(
-                    core_id as u32,
-                    EventType::TargetLocalCycle,
-                    false,
-                    unsafe { qemu_api::qemu_plugin_get_vcpu_vtime(core_id as u32) },
-                );
+                // update the local target time before writing the statistics
+                for core_id in 0..CORE_COUNT {
+                    Statistics::global_set(
+                        core_id as u32,
+                        EventType::TargetLocalCycle,
+                        false,
+                        unsafe { qemu_api::qemu_plugin_get_vcpu_vtime(core_id as u32) },
+                    );
+                }
+
+                let ts = get_monotonic_ts();
+                // Write detailed statistics
+                for stat in Statistics::global_get_line_for_all_cores(ts) {
+                    miss_file.write_all(stat.as_bytes()).unwrap();
+                    miss_file.write_all(b"\n").unwrap();
+                }
+                miss_file.flush().unwrap();
+
+                // Write to Host summary CSV
+                if let Some(ref mut file) = host_summary_file {
+                    let (cache_misses_total, _, _) = Statistics::global_query_record_all_cores(
+                        EventType::SharedCacheMissDueToDataWrite
+                    );
+                    file.write_fmt(format_args!("{},{},{}\n", ts, dirty_page_count, cache_misses_total))
+                        .unwrap();
+                    file.flush().unwrap();
+                }
+
+                next_host_log_time = std::time::Instant::now() + std::time::Duration::from_secs(10);
             }
 
-            let ts = get_monotonic_ts();
-            for stat in Statistics::global_get_line_for_all_cores(ts) {
-                miss_file.write_all(stat.as_bytes()).unwrap();
-                miss_file.write_all(b"\n").unwrap();
+            // 2. Guest Time Logging (Every 1s Virtual Time)
+            if crate::parameter::ENABLE_DIRTY_PAGE_TRACKER {
+                // Use vCP0 time as reference
+                let current_guest_time_ns = unsafe { qemu_api::qemu_plugin_get_vcpu_vtime(0) };
+                
+                if current_guest_time_ns >= next_guest_log_time_ns {
+                    let dirty_page_count = crate::components::dirty_page_tracker::swap_guest_buffers();
+                    
+                    if let Some(ref mut file) = guest_summary_file {
+                        let (cache_misses_total, _, _) = Statistics::global_query_record_all_cores(
+                            EventType::SharedCacheMissDueToDataWrite
+                        );
+                        file.write_fmt(format_args!(
+                            "{},{},{}\n",
+                            current_guest_time_ns, dirty_page_count, cache_misses_total
+                        ))
+                        .unwrap();
+                        file.flush().unwrap();
+                    }
+
+                    // Advance target. If we are behind (e.g. after a jump), leap forward 
+                    // to the next 1s boundary to avoid a "log storm".
+                    while next_guest_log_time_ns <= current_guest_time_ns {
+                        next_guest_log_time_ns += 100_000_000;
+                    }
+                }
             }
 
-            // Write to summary CSV: dirty pages and SharedCacheMissDueToDataWrite
-            if let Some(ref mut file) = summary_file {
-                let (cache_misses_total, _, _) = Statistics::global_query_record_all_cores(
-                    EventType::SharedCacheMissDueToDataWrite
-                );
-                file.write_fmt(format_args!("{},{},{}\n", ts, dirty_page_count, cache_misses_total))
-                    .unwrap();
-                file.flush().unwrap();
-            }
-
-            std::thread::sleep(std::time::Duration::from_secs(10));
+            // Sleep for 100ms to avoid busy waiting
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     });
 }
